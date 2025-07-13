@@ -1,0 +1,128 @@
+name: SuperAGI Fork Diagnostic and Fix
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnose_and_fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Diagnose SuperAGI Repository
+        run: |
+          echo "=== SUPERAGI REPOSITORY DIAGNOSTICS ==="
+          echo "Repository: ${{ github.repository }}"
+          echo "Default branch: ${{ github.event.repository.default_branch }}"
+          
+          echo "=== CURRENT REMOTES ==="
+          git remote -v
+          
+          echo "=== CURRENT BRANCHES ==="
+          git branch -a
+          
+          echo "=== TEST UPSTREAM ACCESS ==="
+          echo "Testing TransformerOptimus/SuperAGI upstream..."
+          UPSTREAM_STATUS=$(git ls-remote https://github.com/TransformerOptimus/SuperAGI.git HEAD 2>&1)
+          if [ $? -eq 0 ]; then
+            echo "✅ Upstream accessible"
+            echo "Latest commit: $(echo "$UPSTREAM_STATUS" | cut -f1)"
+          else
+            echo "❌ Upstream not accessible: $UPSTREAM_STATUS"
+          fi
+          
+          echo "=== FORK INFORMATION ==="
+          FORK_INFO=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}")
+          echo "Is fork: $(echo "$FORK_INFO" | jq -r '.fork')"
+          echo "Parent: $(echo "$FORK_INFO" | jq -r '.parent.full_name // "none"')"
+          echo "Parent URL: $(echo "$FORK_INFO" | jq -r '.parent.clone_url // "none"')"
+          
+          echo "=== CHECKING FOR LARGE FILES ==="
+          # SuperAGI might have large files that could cause sync issues
+          find . -name "*.gz" -o -name "*.tar" -o -name "*.zip" | head -10
+          
+          echo "=== RECENT LOCAL COMMITS ==="
+          git log --oneline -5
+          
+      - name: Fix Upstream Remote and Sync
+        run: |
+          echo "=== FIXING SUPERAGI UPSTREAM ==="
+          
+          # Setup git config
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Remove existing upstream if present
+          git remote remove upstream 2>/dev/null || echo "No existing upstream to remove"
+          
+          # Add correct upstream
+          echo "Adding upstream: https://github.com/TransformerOptimus/SuperAGI.git"
+          git remote add upstream https://github.com/TransformerOptimus/SuperAGI.git
+          
+          # Fetch with timeout (SuperAGI is a large repo)
+          echo "Fetching from upstream (this may take a while for large repos)..."
+          timeout 300 git fetch upstream || {
+            echo "⚠️ Fetch timed out after 5 minutes - repo might be very large"
+            echo "Trying shallow fetch..."
+            git fetch upstream --depth=1
+          }
+          
+          # Determine main branch
+          DEFAULT_BRANCH=$(git remote show upstream | grep 'HEAD branch' | cut -d' ' -f5 2>/dev/null || echo "main")
+          echo "Default branch: $DEFAULT_BRANCH"
+          
+          # Ensure we're on the right local branch
+          git checkout $DEFAULT_BRANCH 2>/dev/null || git checkout -b $DEFAULT_BRANCH upstream/$DEFAULT_BRANCH
+          
+          # Check sync status
+          BEHIND=$(git rev-list --count HEAD..upstream/$DEFAULT_BRANCH 2>/dev/null || echo "unknown")
+          echo "Commits behind upstream: $BEHIND"
+          
+          if [ "$BEHIND" != "unknown" ] && [ "$BEHIND" -gt "0" ]; then
+            echo "Syncing $BEHIND commits from upstream..."
+            
+            # For large repos, use a more conservative merge strategy
+            git merge upstream/$DEFAULT_BRANCH --no-edit --strategy-option=theirs || {
+              echo "⚠️ Merge failed, trying reset strategy..."
+              git reset --hard upstream/$DEFAULT_BRANCH
+            }
+            
+            # Push with force-with-lease for safety
+            git push origin $DEFAULT_BRANCH --force-with-lease || {
+              echo "❌ Push failed - may need manual intervention"
+              echo "This could be due to:"
+              echo "1. Large file size limits"
+              echo "2. Permission issues"
+              echo "3. Branch protection rules"
+              exit 1
+            }
+            
+            echo "✅ Successfully synced SuperAGI fork"
+          else
+            echo "✅ Already up to date with upstream"
+          fi
+          
+      - name: Verify Sync and Repository Health
+        run: |
+          echo "=== VERIFICATION ==="
+          git remote -v
+          echo "Current HEAD: $(git rev-parse HEAD)"
+          echo "Upstream HEAD: $(git rev-parse upstream/main 2>/dev/null || git rev-parse upstream/master)"
+          
+          echo "=== REPOSITORY SIZE CHECK ==="
+          du -sh .git
+          echo "Total files: $(find . -type f | wc -l)"
+          
+          echo "=== SYNC STATUS ==="
+          if [ "$(git rev-parse HEAD)" = "$(git rev-parse upstream/main 2>/dev/null || git rev-parse upstream/master)" ]; then
+            echo "🎉 Perfect sync! Fork is identical to upstream"
+          else
+            echo "⚠️ Some differences remain - this might be normal for SuperAGI"
+            echo "Recent upstream commits not in fork:"
+            git log --oneline HEAD..upstream/main 2>/dev/null || git log --oneline HEAD..upstream/master 2>/dev/null | head -3
+          fi
+          
+          echo "✅ SuperAGI fork diagnostic complete"
